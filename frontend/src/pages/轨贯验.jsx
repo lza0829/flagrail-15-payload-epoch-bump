@@ -11,7 +11,15 @@ export default function 轨贯验() {
       <h1 className="题">轨贯验</h1>
       <p className="述">入轨版本 ↔ 下发票 ↔ 回读 ↔ 命运 互证。悬空下发 / 回读拧花 / 回滚无命运 → 不通过。</p>
       <div className="行">
-        <button onClick={async () => { const g = await post("/贯验"); await 刷(); set讯(g.是否通过 ? "通过" : g.说明); }}>跑贯验</button>
+        <button onClick={async () => {
+          try {
+            const g = await post("/贯验");
+            await 刷();
+            set讯(g.是否通过
+              ? `通过 · 纪元/哈希核证 ${g.核证项?.length || 0} 项 · 作废旧钉 ${g.旧钉数 ?? 0} · 旁置 ${g.旁置数 ?? 0}`
+              : g.说明);
+          } catch (e) { set讯(String(e)); }
+        }}>跑贯验</button>
         <button className="次" onClick={() => 刷()}>刷新</button>
       </div>
       {讯 && <p className="讯">{讯}</p>}

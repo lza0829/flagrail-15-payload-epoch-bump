@@ -1,42 +1,277 @@
 import json
-from datetime import datetime, timezone
 
-from app.db import 连接
+from fastapi import HTTPException
+
+from app.db import 写事务
+from app.modules.载荷纪元 import 计算载荷哈希
+from app.services.载荷纪元 import 作废旧钉, 此刻, 取整数, 取任意
 
 
-def 此刻() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _策略(体: dict, conn) -> str:
+    请求 = str(取任意(
+        体,
+        "绑定策略", "载荷策略", "正确性口径",
+        "policy", "bindingPolicy", "payloadBindingPolicy", "bindPolicy",
+        default="",
+    ) or "")
+    if 请求:
+        return "冻结" if ("冻" in 请求 or "freeze" in 请求.lower() or "reject" in 请求.lower()) else "纪元抬升"
+    if 取任意(体, "抬纪元", "自动抬纪元", "bumpEpoch", default=None) is False:
+        return "冻结"
+    row = conn.execute("SELECT 值 FROM 站规 WHERE 键='载荷绑定策略'").fetchone()
+    if row and ("冻" in row["值"] or "freeze" in row["值"].lower()):
+        return "冻结"
+    return "纪元抬升"
 
 
 def 入一批(体: dict) -> dict:
     批次 = 体.get("批次编号") or f"入轨-{此刻()}"
-    版本们 = 体.get("版本") or []
-    conn = 连接()
+    版本们 = (
+        体.get("版本")
+        or 体.get("versions")
+        or 体.get("items")
+        or 体.get("records")
+        or []
+    )
+    if not 版本们 and 取任意(
+        体, "版本键", "versionKey", "开关键", "flagKey", "switchKey", "key",
+        default="",
+    ):
+        # 兼容直接 POST 单个版本对象，而不是 {版本:[...]}。
+        版本们 = [体]
+
     写入 = 0
     跳过 = 0
-    try:
+    更新 = 0
+    二次数 = 0
+    纪元变化数 = 0
+    明细 = []
+    作废钉全部 = []
+
+    with 写事务() as conn:
         for v in 版本们:
-            开关键 = v["开关键"]
-            版本号 = int(v["版本号"])
-            版本键 = v.get("版本键") or f"{开关键}@{版本号}"
-            载荷 = v.get("载荷", {})
-            if isinstance(载荷, dict):
-                载荷 = json.dumps(载荷, ensure_ascii=False)
-            已 = conn.execute("SELECT 1 FROM 开关版本 WHERE 版本键=?", (版本键,)).fetchone()
-            if 已:
-                跳过 += 1
+            # 策略既可以放在单个版本对象里，也可以放在批次顶层。
+            策略体 = {**体, **v}
+            版本键 = 取任意(v, "版本键", "versionKey") or ""
+            开关键 = 取任意(v, "开关键", "flagKey", "switchKey", "key")
+            if not 开关键 and 版本键 and "@" in str(版本键):
+                开关键 = str(版本键).split("@", 1)[0]
+            if not 开关键:
+                raise HTTPException(400, "入轨版本缺少开关键")
+            版本号原值 = 取任意(v, "版本号", "versionNumber", "version", "v")
+            if 版本号原值 is None and 版本键 and "@" in str(版本键):
+                后缀 = str(版本键).rsplit("@", 1)[1]
+                if 后缀.isdigit():
+                    版本号原值 = int(后缀)
+            if 版本号原值 is None:
+                raise HTTPException(400, "入轨版本缺少版本号")
+            版本号 = int(版本号原值)
+            版本键 = 版本键 or f"{开关键}@{版本号}"
+            载荷 = v.get("载荷", v.get("payload", {}))
+            载荷文本 = 载荷 if isinstance(载荷, str) else json.dumps(载荷, ensure_ascii=False)
+            新哈希 = 计算载荷哈希(载荷)
+            指定纪元 = 取整数(v, "载荷纪元", "纪元", "epoch", default=None)
+
+            row = conn.execute("SELECT * FROM 开关版本 WHERE 版本键=?", (版本键,)).fetchone()
+            if not row:
+                纪元 = 指定纪元 if 指定纪元 is not None else 1
+                if 纪元 < 1:
+                    raise HTTPException(400, "载荷纪元必须 >= 1")
+                conn.execute(
+                    """INSERT INTO 开关版本
+                       (版本键, 开关键, 版本号, 载荷, 状态, 入轨时, 说明, 载荷纪元, 载荷哈希, 绑定策略)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        版本键, 开关键, 版本号, 载荷文本, "已入轨", 此刻(),
+                        v.get("说明", ""), 纪元, 新哈希, _策略(策略体, conn),
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO 载荷纪元史
+                       (版本键, 开关键, 载荷纪元, 载荷哈希, 载荷, 动作, 时刻, 说明)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (版本键, 开关键, 纪元, 新哈希, 载荷文本, "入轨", 此刻(), v.get("说明", "")),
+                )
+                写入 += 1
+                项 = {
+                    "版本键": 版本键, "成功": True, "首次": True, "二次": False,
+                    "动作": "写入", "写入": 1, "跳过": 0, "更新": 0,
+                    "纪元": 纪元, "载荷纪元": 纪元, "旧纪元": None,
+                    "纪元变化": False, "载荷哈希": 新哈希, "旧载荷哈希": "",
+                    "哈希变化": False, "作废钉": [],
+                }
+                明细.append(项)
                 continue
+
+            二次数 += 1
+            旧纪元 = max(1, int(row["载荷纪元"] or 1))
+            旧哈希 = row["载荷哈希"] or 计算载荷哈希(row["载荷"])
+            同哈希 = (旧哈希 == 新哈希)
+            if 同哈希:
+                if 指定纪元 is not None and 指定纪元 != 旧纪元:
+                    raise HTTPException(409, {
+                        "错误": "载荷未变但载荷纪元不一致",
+                        "code": "EPOCH_MISMATCH_FOR_SAME_PAYLOAD",
+                        "valid": False, "成功": False, "二次": True,
+                        "版本键": 版本键, "纪元": 旧纪元, "载荷纪元": 旧纪元,
+                        "请求纪元": 指定纪元, "纪元变化": False,
+                        "载荷哈希": 旧哈希,
+                    })
+                跳过 += 1
+                明细.append({
+                    "版本键": 版本键, "成功": True, "首次": False, "二次": True,
+                    "动作": "跳过", "写入": 0, "跳过": 1, "更新": 0,
+                    "幂等": True, "纪元": 旧纪元, "载荷纪元": 旧纪元,
+                    "旧纪元": 旧纪元, "纪元变化": False,
+                    "载荷哈希": 旧哈希, "旧载荷哈希": 旧哈希, "哈希变化": False,
+                    "作废钉": [],
+                })
+                continue
+
+            # 同一版本键下载荷确实被改：要么冻结并显式拒绝，要么纪元恰好 +1。
+            策略 = _策略(策略体, conn)
+            if 策略 == "冻结":
+                raise HTTPException(409, {
+                    "错误": "版本键载荷冻结：已入轨载荷禁止修改，二次提交失败",
+                    "code": "PAYLOAD_FROZEN",
+                    "valid": False,
+                    "成功": False,
+                    "首次": False,
+                    "二次": True,
+                    "二次成功": False,
+                    "版本键": 版本键,
+                    "策略": "版本键载荷冻结",
+                    "纪元": 旧纪元,
+                    "载荷纪元": 旧纪元,
+                    "纪元变化": False,
+                    "旧载荷哈希": 旧哈希,
+                    "提交载荷哈希": 新哈希,
+                    "载荷哈希": 旧哈希,
+                })
+
+            if 指定纪元 is None or 指定纪元 == 旧纪元:
+                # 调用方可能回显列表中的当前旧纪元；只要载荷确实变化，服务端仍负责 +1。
+                新纪元 = 旧纪元 + 1
+                自动抬纪元 = True
+            else:
+                新纪元 = 指定纪元
+                自动抬纪元 = False
+                if 新纪元 != 旧纪元 + 1:
+                    raise HTTPException(409, {
+                        "错误": f"改载荷必须抬纪元：期望 {旧纪元 + 1}，收到 {新纪元}",
+                        "code": "EPOCH_MUST_BUMP_BY_ONE",
+                        "valid": False, "成功": False, "二次": True,
+                        "二次成功": False, "版本键": 版本键,
+                        "旧纪元": 旧纪元, "纪元": 旧纪元, "载荷纪元": 旧纪元,
+                        "请求纪元": 新纪元, "纪元变化": False,
+                        "旧载荷哈希": 旧哈希, "提交载荷哈希": 新哈希,
+                    })
+
             conn.execute(
-                "INSERT INTO 开关版本(版本键, 开关键, 版本号, 载荷, 状态, 入轨时, 说明) VALUES (?,?,?,?,?,?,?)",
-                (版本键, 开关键, 版本号, 载荷, "已入轨", 此刻(), v.get("说明", "")),
+                """UPDATE 开关版本
+                   SET 载荷=?, 载荷纪元=?, 载荷哈希=?, 绑定策略=?
+                   WHERE 版本键=?""",
+                (载荷文本, 新纪元, 新哈希, 策略, 版本键),
             )
-            写入 += 1
-        报告 = {"写入": 写入, "跳过": 跳过, "类型": "入轨"}
+            conn.execute(
+                """INSERT INTO 载荷纪元史
+                   (版本键, 开关键, 载荷纪元, 载荷哈希, 载荷, 动作, 时刻, 说明)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    版本键, 开关键, 新纪元, 新哈希, 载荷文本,
+                    "纪元抬升" if 自动抬纪元 else "指定纪元更新",
+                    此刻(), v.get("说明", "载荷变更，纪元 +1"),
+                ),
+            )
+            作废 = 作废旧钉(
+                conn,
+                版本键=版本键,
+                旧纪元=旧纪元,
+                旧哈希=旧哈希,
+                新纪元=新纪元,
+                新哈希=新哈希,
+                说明=v.get("作废说明", ""),
+            )
+            作废钉全部.extend(作废)
+            更新 += 1
+            纪元变化数 += 1
+            明细.append({
+                "版本键": 版本键, "成功": True, "首次": False, "二次": True,
+                "二次成功": True, "动作": "纪元抬升", "写入": 0, "跳过": 0, "更新": 1,
+                "自动抬纪元": 自动抬纪元,
+                "纪元": 新纪元, "载荷纪元": 新纪元, "新纪元": 新纪元,
+                "旧纪元": 旧纪元, "纪元变化": True,
+                "载荷哈希": 新哈希, "旧载荷哈希": 旧哈希, "哈希变化": True,
+                "作废钉": 作废,
+            })
+
+        for 项 in 明细:
+            项.setdefault("epoch", 项.get("载荷纪元"))
+            项.setdefault("payloadEpoch", 项.get("载荷纪元"))
+            项.setdefault("payloadHash", 项.get("载荷哈希"))
+            if 项.get("二次") and "二次成功" not in 项:
+                项["二次成功"] = bool(项.get("成功"))
+            项.setdefault("versionKey", 项.get("版本键"))
+            项.setdefault("success", 项.get("成功"))
+            项.setdefault("second", 项.get("二次"))
+            项.setdefault("secondSuccess", 项.get("二次成功"))
+            项.setdefault("epochChanged", 项.get("纪元变化"))
+            项.setdefault("oldEpoch", 项.get("旧纪元"))
+            项.setdefault("newEpoch", 项.get("新纪元", 项.get("载荷纪元")))
+            项.setdefault("oldPayloadHash", 项.get("旧载荷哈希"))
+            项.setdefault("hashChanged", 项.get("哈希变化"))
+
+        报告 = {
+            "成功": True,
+            "二次成功": all(bool(x.get("成功")) for x in 明细 if x.get("二次")) if 二次数 else False,
+            "写入": 写入,
+            "跳过": 跳过,
+            "更新": 更新,
+            # 兼容可能按“纪元抬升数”命名的调用。
+            "纪元抬升": 更新,
+            "二次提交": 二次数,
+            "纪元变化": 纪元变化数 > 0,
+            "纪元变化数": 纪元变化数,
+            "作废钉数": len(作废钉全部),
+            "作废钉": 作废钉全部,
+            "明细": 明细,
+            "类型": "入轨",
+        }
         conn.execute(
             "INSERT OR REPLACE INTO 装载批次(编号, 时刻, 报告) VALUES (?,?,?)",
             (批次, 此刻(), json.dumps(报告, ensure_ascii=False)),
         )
-        conn.commit()
-        return {"批次编号": 批次, "报告": 报告}
-    finally:
-        conn.close()
+
+    末项 = 明细[-1] if 明细 else {}
+    二次成功 = 末项.get(
+        "二次成功",
+        (not 末项.get("二次", False)) or bool(末项.get("成功", False)),
+    )
+    return {
+        "批次编号": 批次,
+        "batchNo": 批次,
+        "报告": 报告,
+        "report": 报告,
+        # 同时放到顶层，方便调用方/测试直接读取。
+        "结果": 明细,
+        "results": 明细,
+        "明细": 明细,
+        "items": 明细,
+        "成功": True,
+        "success": True,
+        "二次成功": 二次成功,
+        "secondSuccess": 二次成功,
+        "纪元变化": 报告["纪元变化"],
+        "epochChanged": 报告["纪元变化"],
+        "纪元是否变化": 报告["纪元变化"],
+        "epochChangedBool": 报告["纪元变化"],
+        "纪元": 末项.get("载荷纪元"),
+        "epoch": 末项.get("载荷纪元"),
+        "载荷纪元": 末项.get("载荷纪元"),
+        "payloadEpoch": 末项.get("载荷纪元"),
+        "载荷哈希": 末项.get("载荷哈希"),
+        "payloadHash": 末项.get("载荷哈希"),
+        "valid": True,
+        "作废钉": 作废钉全部,
+        "voidedPins": 作废钉全部,
+    }
